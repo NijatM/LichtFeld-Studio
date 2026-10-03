@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <memory>
@@ -184,6 +185,41 @@ TEST(BlobSeeding, SeedsTriangulatedBlobsThatReferencePointsMiss) {
         EXPECT_NEAR(std::exp(seeds.log_scales[i]), 1.5f * 6.0f / FOCAL, 0.03f);
         expected[nearest] = {1e3f, 1e3f, 1e3f};
     }
+}
+
+// Fails if detection on block-averaged images keeps the full-resolution intrinsics (seeds miss the blobs and get
+// the full-resolution footprint) or if uint8 targets are not normalised before detection.
+TEST(BlobSeeding, CappedDetectionResolutionKeepsSeedsOnTheBlobs) {
+    const std::vector<Vec3> bright{{0.3f, 0.2f, -0.4f}, {-0.5f, -0.1f, 0.6f}, {0.7f, 0.4f, 0.2f}};
+    lfs::training::BlobSeeder seeder(shell_points({}), WIDTH * HEIGHT / 4);
+
+    constexpr int VIEWS = 24;
+    for (int i = 0; i < VIEWS; ++i) {
+        const auto view = ring_view(i, VIEWS);
+        auto image = grey_image();
+        int x = 0, y = 0;
+        for (const auto& p : bright)
+            if (project(view, p, x, y))
+                draw_square(image, x, y, 1.0f);
+        seeder.capture(*view.camera, (image * 255.0f).to(DataType::UInt8).cuda());
+    }
+    ASSERT_EQ(seeder.captured_views(), static_cast<size_t>(VIEWS));
+
+    // One detection pixel spans more depth here than the merge radius, so a blob may get several seeds.
+    const auto seeds = seeder.triangulate();
+    ASSERT_GE(seeds.size(), bright.size());
+    std::vector<bool> covered(bright.size(), false);
+    for (size_t i = 0; i < seeds.size(); ++i) {
+        const float* m = seeds.means.data() + i * 3;
+        size_t nearest = 0;
+        for (size_t b = 1; b < bright.size(); ++b)
+            if (distance(m, bright[b]) < distance(m, bright[nearest]))
+                nearest = b;
+        EXPECT_LT(distance(m, bright[nearest]), 0.1f) << "seed " << i;
+        covered[nearest] = true;
+        EXPECT_NEAR(std::exp(seeds.log_scales[i]), 2.0f * 1.5f * 6.0f / FOCAL, 0.03f);
+    }
+    EXPECT_TRUE(std::ranges::all_of(covered, [](const bool c) { return c; }));
 }
 
 TEST(BlobSeeding, IgnoresViewsWithoutPinholeImages) {

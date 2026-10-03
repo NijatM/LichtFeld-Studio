@@ -312,7 +312,73 @@ namespace lfs::training::kernels::blob_seeding {
         }
     } // namespace
 
+    namespace {
+        template <typename T>
+        __global__ void box_downsample_rgb(const T* __restrict__ source, float* __restrict__ output,
+                                           const int source_height, const int source_width,
+                                           const int height, const int width, const int factor,
+                                           const float denominator) {
+            const int x = blockIdx.x * blockDim.x + threadIdx.x;
+            const int y = blockIdx.y;
+            if (x >= width)
+                return;
+            const float block = static_cast<float>(factor * factor);
+            for (int c = 0; c < 3; ++c) {
+                const T* plane = source + static_cast<size_t>(c) * source_height * source_width;
+                float sum = 0.0f;
+                for (int dy = 0; dy < factor; ++dy) {
+                    const T* row = plane + static_cast<size_t>(y * factor + dy) * source_width + x * factor;
+                    for (int dx = 0; dx < factor; ++dx)
+                        sum += static_cast<float>(row[dx]);
+                }
+                output[(static_cast<size_t>(c) * height + y) * width + x] = sum / block / denominator;
+            }
+        }
+    } // namespace
+
+    Tensor downsample_rgb(const Tensor& image, const int factor, DetectionWorkspace& workspace) {
+        assert(image.device() == Device::CUDA && image.ndim() == 3 && image.shape()[0] >= 3 && factor >= 1);
+        assert(image.dtype() == DataType::UInt8 || image.dtype() == DataType::Float32);
+        const auto source = image.contiguous();
+        const int source_height = static_cast<int>(source.shape()[1]);
+        const int source_width = static_cast<int>(source.shape()[2]);
+        const int height = source_height / factor;
+        const int width = source_width / factor;
+        const cudaStream_t stream = source.stream();
+        const size_t elements = 3 * static_cast<size_t>(height) * static_cast<size_t>(width);
+        if (!workspace.rgb.is_valid() || workspace.rgb.numel() < elements) {
+            workspace.rgb = Tensor::empty({elements}, Device::CUDA, DataType::Float32);
+            workspace.rgb.set_stream(stream);
+        }
+        workspace.rgb.sync_to_stream(stream);
+        auto output = workspace.rgb.slice(0, 0, elements)
+                          .reshape(TensorShape({3, static_cast<size_t>(height), static_cast<size_t>(width)}));
+        if (height == 0 || width == 0)
+            return output;
+        const dim3 grid((width + BLOCK_SIZE - 1) / BLOCK_SIZE, height);
+        if (source.dtype() == DataType::UInt8) {
+            box_downsample_rgb<<<grid, BLOCK_SIZE, 0, stream>>>(source.ptr<uint8_t>(), output.ptr<float>(),
+                                                                source_height, source_width, height, width, factor,
+                                                                255.0f);
+        } else {
+            box_downsample_rgb<<<grid, BLOCK_SIZE, 0, stream>>>(source.ptr<float>(), output.ptr<float>(),
+                                                                source_height, source_width, height, width, factor,
+                                                                1.0f);
+        }
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.blob_seeding.downsample");
+        return output;
+    }
+
     ViewPeaks detect_peaks(const Tensor& image, const int view) {
+        DetectionWorkspace workspace;
+        auto peaks = detect_peaks(image, view, workspace);
+        if (peaks.peaks.is_valid())
+            peaks.peaks = peaks.peaks.clone();
+        peaks.bitmap = peaks.bitmap.clone();
+        return peaks;
+    }
+
+    ViewPeaks detect_peaks(const Tensor& image, const int view, DetectionWorkspace& workspace) {
         assert(image.device() == Device::CUDA && image.dtype() == DataType::Float32);
         assert(image.ndim() == 3 && image.shape()[0] >= 3);
         nvtxRangePush("blob_seeding.detect_peaks");
@@ -329,19 +395,30 @@ namespace lfs::training::kernels::blob_seeding {
             t.set_stream(stream);
             return t;
         };
-        auto rows = make({n}, DataType::Float32);
-        auto a = make({n, 2}, DataType::Float32);
-        auto b = make({n, 2}, DataType::Float32);
-        auto c = make({n, 2}, DataType::Float32);
-        auto mask = make({n}, DataType::UInt8);
-        auto peaks = make({static_cast<size_t>(capacity), static_cast<size_t>(PeakFieldCount)}, DataType::Float32);
-        auto counters = make({3}, DataType::Int32);
+        auto reserve = [&](Tensor& buffer, const size_t elements, const DataType dtype) {
+            if (!buffer.is_valid() || buffer.numel() < elements)
+                buffer = make({elements}, dtype);
+            buffer.sync_to_stream(stream);
+        };
+        reserve(workspace.rows, n, DataType::Float32);
+        reserve(workspace.a, 2 * n, DataType::Float32);
+        reserve(workspace.b, 2 * n, DataType::Float32);
+        reserve(workspace.c, 2 * n, DataType::Float32);
+        reserve(workspace.mask, n, DataType::UInt8);
+        reserve(workspace.peaks, static_cast<size_t>(capacity) * PeakFieldCount, DataType::Float32);
+        reserve(workspace.counters, 3, DataType::Int32);
+        auto& rows = workspace.rows;
+        auto& mask = workspace.mask;
+        auto& counters = workspace.counters;
         counters.zero_();
-        auto bitmap = make({words}, DataType::UInt32);
+        const auto peaks = workspace.peaks.slice(0, 0, static_cast<size_t>(capacity) * PeakFieldCount)
+                               .reshape(TensorShape({static_cast<size_t>(capacity), static_cast<size_t>(PeakFieldCount)}));
+        reserve(workspace.bitmap, words, DataType::UInt32);
+        auto bitmap = workspace.bitmap.slice(0, 0, words);
 
-        auto* pa = reinterpret_cast<float2*>(a.ptr<float>());
-        auto* pb = reinterpret_cast<float2*>(b.ptr<float>());
-        auto* pc = reinterpret_cast<float2*>(c.ptr<float>());
+        auto* pa = reinterpret_cast<float2*>(workspace.a.ptr<float>());
+        auto* pb = reinterpret_cast<float2*>(workspace.b.ptr<float>());
+        auto* pc = reinterpret_cast<float2*>(workspace.c.ptr<float>());
         const dim3 grid((width + BLOCK_SIZE - 1) / BLOCK_SIZE, height);
         const auto g = gaussian_weights();
 
@@ -365,7 +442,7 @@ namespace lfs::training::kernels::blob_seeding {
         extrema_pass<false><<<grid, BLOCK_SIZE, 0, stream>>>(pb, pc, height, width, PEAK_NMS_RADIUS, true, true);
         LFS_CUDA_LAUNCH_CHECK(stream, "training.blob_seeding.peak_window");
         emit_peaks<<<blocks_for(n), BLOCK_SIZE, 0, stream>>>(pa, pc, source.ptr<float>(), mask.ptr<uint8_t>(),
-                                                             peaks.ptr<float>(), counters.ptr<int>(), capacity,
+                                                             workspace.peaks.ptr<float>(), counters.ptr<int>(), capacity,
                                                              height, width, static_cast<float>(view));
         LFS_CUDA_LAUNCH_CHECK(stream, "training.blob_seeding.emit_peaks");
         pack_dilated_peaks<<<blocks_for(words), BLOCK_SIZE, 0, stream>>>(
@@ -378,8 +455,8 @@ namespace lfs::training::kernels::blob_seeding {
         const size_t emitted = static_cast<size_t>(std::min(counts[0], capacity));
         ViewPeaks result;
         if (emitted > 0)
-            result.peaks = peaks.slice(0, 0, emitted).clone();
-        result.bitmap = std::move(bitmap);
+            result.peaks = peaks.slice(0, 0, emitted);
+        result.bitmap = bitmap;
         result.density = {static_cast<float>(static_cast<unsigned int>(counts[1])) / static_cast<float>(n),
                           static_cast<float>(static_cast<unsigned int>(counts[2])) / static_cast<float>(n)};
         nvtxRangePop();

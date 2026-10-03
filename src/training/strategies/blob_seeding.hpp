@@ -30,7 +30,11 @@ namespace lfs::training {
     // does not already cover.
     class BlobSeeder {
     public:
-        explicit BlobSeeder(lfs::core::Tensor reference_points);
+        // Detection runs on block averages of images above this pixel count: its buffers scale with it.
+        static constexpr size_t DEFAULT_MAX_DETECTION_PIXELS = 3'000'000;
+
+        explicit BlobSeeder(lfs::core::Tensor reference_points,
+                            size_t max_detection_pixels = DEFAULT_MAX_DETECTION_PIXELS);
 
         void capture(const lfs::core::Camera& camera, const lfs::core::Tensor& image);
         [[nodiscard]] size_t captured_views() const { return _views.size(); }
@@ -48,6 +52,8 @@ namespace lfs::training {
         std::vector<CapturedView> _views;
         std::unordered_set<int> _captured_uids;
         size_t _captured_bytes = 0;
+        size_t _max_detection_pixels;
+        kernels::blob_seeding::DetectionWorkspace _workspace;
     };
 
 } // namespace lfs::training
