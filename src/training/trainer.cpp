@@ -5759,6 +5759,9 @@ namespace lfs::training {
     }
 
     lfs::core::Tensor Trainer::get_random_background_for_camera(int width, int height, int iteration) {
+        const float noise_weight = inv_weight_piecewise(iteration, get_total_iterations());
+        if (noise_weight <= 0.0f)
+            return {};
         const size_t required_size = 3 * static_cast<size_t>(height) * static_cast<size_t>(width);
 
         if (!random_bg_buffer_.is_valid() || random_bg_buffer_.numel() != required_size) {
@@ -5774,6 +5777,8 @@ namespace lfs::training {
             static_cast<uint64_t>(iteration),
             random_bg_buffer_.stream());
 
+        if (noise_weight < 1.0f)
+            return random_bg_buffer_ * noise_weight + background_.reshape({3, 1, 1}) * (1.0f - noise_weight);
         return random_bg_buffer_;
     }
 
