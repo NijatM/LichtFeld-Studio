@@ -1194,6 +1194,7 @@ namespace lfs::io {
                 lfs::core::Device::CPU, lfs::core::DataType::UInt8);
             auto gpu_uint8 = cpu_tensor.to(lfs::core::Device::CUDA);
             gpu_uint8.set_name("io.image.gpu_staging");
+            const cudaStream_t stream = gpu_uint8.stream();
             if (used_stbi)
                 stbi_image_free(img_data);
             else
@@ -1207,7 +1208,7 @@ namespace lfs::io {
                 cuda::launch_uint8_hwc_to_uint8_chw(
                     reinterpret_cast<const uint8_t*>(gpu_uint8.data_ptr()),
                     reinterpret_cast<uint8_t*>(decoded.data_ptr()),
-                    H, W, C, nullptr);
+                    H, W, C, stream);
             } else {
                 decoded = lfs::core::Tensor::empty(
                     lfs::core::TensorShape({C, H, W}),
@@ -1216,13 +1217,14 @@ namespace lfs::io {
                 cuda::launch_uint8_hwc_to_float32_chw(
                     reinterpret_cast<const uint8_t*>(gpu_uint8.data_ptr()),
                     reinterpret_cast<float*>(decoded.data_ptr()),
-                    H, W, C, nullptr);
+                    H, W, C, stream);
             }
+            assert(decoded.stream() == stream);
 
             if (is_nvcodec_available()) {
                 try {
                     auto nvcodec = acquire_nvcodec_loader(config_.decoder_pool_size);
-                    auto jpeg_bytes = nvcodec->encode_to_jpeg(decoded, config_.cache_jpeg_quality, nullptr);
+                    auto jpeg_bytes = nvcodec->encode_to_jpeg(decoded, config_.cache_jpeg_quality, stream);
                     auto jpeg_shared = std::make_shared<std::vector<uint8_t>>(std::move(jpeg_bytes));
                     put_in_jpeg_cache(cache_key, jpeg_shared);
 
@@ -2857,6 +2859,20 @@ namespace lfs::io {
                         apply_requested_undistort(rgb, item.params);
                         const UndistortSlotGuard slot;
                         alpha = lfs::core::undistort_mask_area(alpha, scaled, nullptr);
+                    }
+
+                    // Later epochs read alpha back from its 16-bit cache: put the first load on the same grid.
+                    {
+                        const size_t alpha_h = alpha.shape()[0];
+                        const size_t alpha_w = alpha.shape()[1];
+                        auto alpha_u16 = lfs::core::Tensor::empty(
+                            alpha.shape(), lfs::core::Device::CUDA, lfs::core::DataType::Float16);
+                        cuda::launch_float32_hwc_to_uint16_hwc(
+                            alpha.ptr<float>(), reinterpret_cast<uint16_t*>(alpha_u16.data_ptr()),
+                            alpha_h, alpha_w, 1, nullptr);
+                        cuda::launch_uint16_hwc_to_float32_hwc(
+                            reinterpret_cast<const uint16_t*>(alpha_u16.data_ptr()), alpha.ptr<float>(),
+                            alpha_h, alpha_w, 1, nullptr);
                     }
 
                     if (is_nvcodec_available()) {
