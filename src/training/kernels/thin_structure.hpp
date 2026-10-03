@@ -8,11 +8,13 @@
 
 namespace lfs::training::kernels {
 
+    // The separable passes run over row bands so the intermediate stays a few MiB at any image size.
     struct LFS_CUDA_API RidgeWorkspace {
-        lfs::core::Tensor luminance;
         lfs::core::Tensor horizontal;
         lfs::core::Tensor reduction;
-        void ensure_size(size_t height, size_t width);
+        size_t band_bytes = size_t{16} << 20;
+        [[nodiscard]] size_t band_rows(size_t height, size_t width) const;
+        void ensure_size(size_t band_rows, size_t width);
     };
 
     LFS_CUDA_API float structure_base_denominator(const lfs::core::Tensor& base_weight, int height, int width, bool valid_padding);

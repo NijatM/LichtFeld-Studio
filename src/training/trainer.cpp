@@ -5661,9 +5661,7 @@ namespace lfs::training {
     }
 
     void Trainer::clear_thin_structure_cache() {
-        thin_structure_cache_.clear();
-        thin_structure_cache_bytes_ = 0;
-        thin_structure_cache_clock_ = 0;
+        thin_structure_map_key_.reset();
         thin_structure_workspace_ = {};
         thin_structure_map_buffer_ = {};
         thin_structure_weight_buffer_ = {};
@@ -5675,36 +5673,17 @@ namespace lfs::training {
         using namespace lfs::core;
         LFS_ASSERT(image.ndim() == 3 && image.shape()[0] == 3);
         const size_t height = image.shape()[1], width = image.shape()[2];
-        const size_t bytes = height * width * sizeof(float);
-        if (auto it = thin_structure_cache_.find(camera_uid); it != thin_structure_cache_.end()) {
-            if (it->second.height == height && it->second.width == width &&
-                it->second.preprocessing_generation == edge_weight_preprocessing_generation_) {
-                it->second.last_used = ++thin_structure_cache_clock_;
-                it->second.tensor.sync_to_stream(image.stream());
-                return it->second.tensor;
-            }
-            thin_structure_cache_bytes_ -= it->second.allocation_bytes;
-            thin_structure_cache_.erase(it);
+        const ThinStructureMapKey key{camera_uid, height, width, edge_weight_preprocessing_generation_};
+        if (thin_structure_map_key_ == key) {
+            thin_structure_map_buffer_.sync_to_stream(image.stream());
+            return thin_structure_map_buffer_;
         }
         if (!thin_structure_map_buffer_.is_valid() || thin_structure_map_buffer_.shape() != TensorShape{height, width})
             thin_structure_map_buffer_ = Tensor::empty({height, width}, Device::CUDA);
         kernels::ridge_structure_map(image, thin_structure_map_buffer_, thin_structure_workspace_);
         ++thin_structure_map_computations_;
-        if (bytes > EDGE_WEIGHT_CACHE_BUDGET_BYTES)
-            return thin_structure_map_buffer_;
-        while (!thin_structure_cache_.empty() &&
-               (thin_structure_cache_.size() >= EDGE_WEIGHT_CACHE_MAX_ENTRIES ||
-                thin_structure_cache_bytes_ > EDGE_WEIGHT_CACHE_BUDGET_BYTES - bytes)) {
-            const auto oldest = std::min_element(thin_structure_cache_.begin(), thin_structure_cache_.end(),
-                                                 [](const auto& a, const auto& b) { return a.second.last_used < b.second.last_used; });
-            thin_structure_cache_bytes_ -= oldest->second.allocation_bytes;
-            thin_structure_cache_.erase(oldest);
-        }
-        auto map = thin_structure_map_buffer_.clone();
-        thin_structure_cache_.insert_or_assign(camera_uid, EdgeWeightCacheEntry{
-                                                               map, height, width, bytes, edge_weight_preprocessing_generation_, ++thin_structure_cache_clock_});
-        thin_structure_cache_bytes_ += bytes;
-        return map;
+        thin_structure_map_key_ = key;
+        return thin_structure_map_buffer_;
     }
 
     void Trainer::clearEdgeWeightCache() {

@@ -939,9 +939,15 @@ namespace lfs::training {
         bool edge_weight_scoring_active_ = false;
         bool composite_target_alpha_ = false;
 
-        std::unordered_map<int, EdgeWeightCacheEntry> thin_structure_cache_;
-        size_t thin_structure_cache_bytes_ = 0;
-        uint64_t thin_structure_cache_clock_ = 0;
+        // Cameras arrive shuffled, so only the photometric and densification lookups of one step share a map.
+        struct ThinStructureMapKey {
+            int camera_uid;
+            size_t height;
+            size_t width;
+            uint64_t preprocessing_generation;
+            bool operator==(const ThinStructureMapKey&) const = default;
+        };
+        std::optional<ThinStructureMapKey> thin_structure_map_key_;
         uint64_t thin_structure_map_computations_ = 0;
         kernels::RidgeWorkspace thin_structure_workspace_;
         kernels::GradientResidualWorkspace gradient_residual_workspace_;

@@ -92,9 +92,9 @@ namespace lfs::training {
             return trainer.get_thin_structure_map(0, image, weight);
         }
         static bool allocated(const Trainer& trainer) {
-            return trainer.thin_structure_workspace_.luminance.is_valid() ||
+            return trainer.thin_structure_workspace_.horizontal.is_valid() ||
                    trainer.thin_structure_weight_buffer_.is_valid() ||
-                   !trainer.thin_structure_cache_.empty() || trainer.thin_structure_map_computations_ != 0;
+                   trainer.thin_structure_map_key_.has_value() || trainer.thin_structure_map_computations_ != 0;
         }
         static auto plain(Trainer& trainer, const core::Tensor& image, const core::Tensor& target,
                           const core::param::OptimizationParameters& params, const core::Tensor& raw) {
@@ -348,6 +348,25 @@ namespace {
             .to(Device::CUDA);
     }
 } // namespace
+
+// Fails if a band seam shifts, drops or mis-reflects rows: eight-row bands must reproduce the single-band map.
+TEST(ThinStructure, RowBandsMatchSingleBand) {
+    if (!std::getenv("LFS_THIN_STRUCTURE_TEST_IMAGE"))
+        GTEST_SKIP() << "set LFS_THIN_STRUCTURE_TEST_IMAGE to run";
+    const auto full_image = read_full_real_image();
+    for (const auto& shape : {TensorShape{3, 61}, TensorShape{37, 61}, TensorShape{full_image.shape()[1], full_image.shape()[2]}}) {
+        SCOPED_TRACE(std::format("{}x{}", shape[0], shape[1]));
+        const auto image = full_image.slice(1, 0, static_cast<int>(shape[0])).slice(2, 0, static_cast<int>(shape[1])).contiguous();
+        RidgeWorkspace single, banded;
+        single.band_bytes = std::numeric_limits<size_t>::max() / 2;
+        banded.band_bytes = 0;
+        ASSERT_EQ(banded.band_rows(shape[0], shape[1]), std::min<size_t>(8, (shape[0] + 7) / 8 * 8));
+        auto expected = Tensor::empty(shape, Device::CUDA), actual = Tensor::empty(shape, Device::CUDA);
+        ridge_structure_map(image, expected, single);
+        ridge_structure_map(image, actual, banded);
+        expect_close(actual, expected, 0.0f);
+    }
+}
 
 TEST(ThinStructure, RidgeBoundaryShapesMatchReference) {
     const auto* image_path = std::getenv("LFS_THIN_STRUCTURE_TEST_IMAGE");

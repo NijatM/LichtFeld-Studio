@@ -12,11 +12,10 @@ namespace lfs::training::kernels {
     inline constexpr float GRADIENT_LOSS_EPSILON = 0.001f;
 
     struct LFS_CUDA_API GradientResidualWorkspace {
-        lfs::core::Tensor coefficients;
         lfs::core::Tensor partial;
         lfs::core::Tensor totals;
         lfs::core::Tensor loss;
-        void ensure_size(size_t pixels);
+        void ensure_allocated();
     };
 
     LFS_CUDA_API lfs::core::Tensor gradient_residual_loss_gradient(

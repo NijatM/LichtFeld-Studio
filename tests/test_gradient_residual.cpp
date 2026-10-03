@@ -100,8 +100,7 @@ namespace {
 namespace lfs::training {
     struct TrainerGradientResidualTestAccess {
         static bool allocated(const Trainer& trainer) {
-            return trainer.gradient_residual_workspace_.coefficients.is_valid() ||
-                   trainer.gradient_residual_workspace_.partial.is_valid() ||
+            return trainer.gradient_residual_workspace_.partial.is_valid() ||
                    trainer.gradient_residual_workspace_.totals.is_valid() ||
                    trainer.gradient_residual_workspace_.loss.is_valid();
         }
@@ -125,7 +124,6 @@ TEST(GradientResidual, ZeroWeightIdenticalInputAndEmptyDomains) {
     GradientResidualWorkspace workspace;
     EXPECT_FALSE(gradient_residual_loss_gradient(image, target, {}, gradient, 0, workspace).is_valid());
     exact(gradient, original);
-    EXPECT_FALSE(workspace.coefficients.is_valid());
     EXPECT_FALSE(workspace.partial.is_valid());
     EXPECT_FALSE(workspace.totals.is_valid());
     EXPECT_FALSE(workspace.loss.is_valid());

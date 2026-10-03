@@ -14,6 +14,8 @@ namespace lfs::training::kernels {
     namespace {
         constexpr int BLOCK_SIZE = 256;
         constexpr int MAX_BLOCKS = 1024;
+        constexpr int TILE_X = 32;
+        constexpr int TILE_Y = 8;
 
         __device__ float sobel_x(const int dx, const int dy) {
             return dx * (dy == 0 ? 2.0f : 1.0f) * 0.125f;
@@ -33,26 +35,34 @@ namespace lfs::training::kernels {
                 return mask[i];
         }
 
+        template <typename T>
+        __device__ float residual_luminance(const float* image, const T* target, const int n, const int i) {
+            const float scale = std::is_same_v<T, uint8_t> ? 1.0f / 255.0f : 1.0f;
+            return 0.2126f * (image[i] - scale * target[i]) +
+                   0.7152f * (image[n + i] - scale * target[n + i]) +
+                   0.0722f * (image[2 * n + i] - scale * target[2 * n + i]);
+        }
+
+        __device__ bool interior(const int x, const int y, const int height, const int width) {
+            return x > 0 && x < width - 1 && y > 0 && y < height - 1;
+        }
+
         template <typename T, typename M>
         __global__ void gradient_residual_forward(
-            const float* image, const T* target, const M* mask,
-            float* coefficients, float* partial,
+            const float* image, const T* target, const M* mask, float* partial,
             const int height, const int width, const float epsilon) {
             const int n = height * width;
             float loss_sum = 0.0f, weight_sum = 0.0f;
             for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
                 const int x = i % width, y = i / width;
-                bool valid = x > 0 && x < width - 1 && y > 0 && y < height - 1;
+                bool valid = interior(x, y, height, width);
                 float gx = 0.0f, gy = 0.0f;
                 if (valid) {
                     for (int dy = -1; dy <= 1; ++dy) {
                         for (int dx = -1; dx <= 1; ++dx) {
                             const int j = i + dy * width + dx;
                             valid = valid && mask_weight(mask, j) > 0.0f;
-                            const float scale = std::is_same_v<T, uint8_t> ? 1.0f / 255.0f : 1.0f;
-                            const float r = 0.2126f * (image[j] - scale * target[j]) +
-                                            0.7152f * (image[n + j] - scale * target[n + j]) +
-                                            0.0722f * (image[2 * n + j] - scale * target[2 * n + j]);
+                            const float r = residual_luminance(image, target, n, j);
                             gx += sobel_x(dx, dy) * r;
                             gy += sobel_y(dx, dy) * r;
                         }
@@ -61,8 +71,6 @@ namespace lfs::training::kernels {
                 const float m = valid ? mask_weight(mask, i) : 0.0f;
                 const float hx = hypotf(gx, epsilon);
                 const float hy = hypotf(gy, epsilon);
-                coefficients[i] = m * gx / hx;
-                coefficients[n + i] = m * gy / hy;
                 loss_sum += m * (hx + hy - 2.0f * epsilon);
                 weight_sum += m;
             }
@@ -92,21 +100,57 @@ namespace lfs::training::kernels {
             }
         }
 
-        __global__ void gradient_residual_backward(const float* coefficients, const float* totals,
-                                                   float* gradient, const int height, const int width) {
-            const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        // Recomputes the forward coefficients of the tile and its one-pixel ring from a two-pixel residual halo,
+        // so no full-resolution coefficient map is stored between the passes.
+        template <typename T, typename M>
+        __global__ void gradient_residual_backward(const float* image, const T* target, const M* mask,
+                                                   const float* totals, float* gradient,
+                                                   const int height, const int width, const float epsilon) {
+            __shared__ float residual[TILE_Y + 4][TILE_X + 4];
+            __shared__ float weight[TILE_Y + 4][TILE_X + 4];
+            __shared__ float coefficient_x[TILE_Y + 2][TILE_X + 2];
+            __shared__ float coefficient_y[TILE_Y + 2][TILE_X + 2];
             const int n = height * width;
-            if (i >= n)
+            const int x0 = blockIdx.x * TILE_X, y0 = blockIdx.y * TILE_Y;
+            const int thread = threadIdx.y * TILE_X + threadIdx.x;
+            for (int k = thread; k < (TILE_Y + 4) * (TILE_X + 4); k += TILE_X * TILE_Y) {
+                const int ly = k / (TILE_X + 4), lx = k % (TILE_X + 4);
+                const int x = x0 + lx - 2, y = y0 + ly - 2;
+                const bool inside = x >= 0 && x < width && y >= 0 && y < height;
+                residual[ly][lx] = inside ? residual_luminance(image, target, n, y * width + x) : 0.0f;
+                weight[ly][lx] = inside ? mask_weight(mask, y * width + x) : 0.0f;
+            }
+            __syncthreads();
+            for (int k = thread; k < (TILE_Y + 2) * (TILE_X + 2); k += TILE_X * TILE_Y) {
+                const int ly = k / (TILE_X + 2), lx = k % (TILE_X + 2);
+                bool valid = interior(x0 + lx - 1, y0 + ly - 1, height, width);
+                float gx = 0.0f, gy = 0.0f;
+                if (valid) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            valid = valid && weight[ly + 1 + dy][lx + 1 + dx] > 0.0f;
+                            const float r = residual[ly + 1 + dy][lx + 1 + dx];
+                            gx += sobel_x(dx, dy) * r;
+                            gy += sobel_y(dx, dy) * r;
+                        }
+                    }
+                }
+                const float m = valid ? weight[ly + 1][lx + 1] : 0.0f;
+                coefficient_x[ly][lx] = m * gx / hypotf(gx, epsilon);
+                coefficient_y[ly][lx] = m * gy / hypotf(gy, epsilon);
+            }
+            __syncthreads();
+            const int x = x0 + threadIdx.x, y = y0 + threadIdx.y;
+            if (x >= width || y >= height)
                 return;
-            const int x = i % width, y = i / width;
+            const int i = y * width + x;
             float value = 0.0f;
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
-                    const int cx = x - dx, cy = y - dy;
-                    if (cx > 0 && cx < width - 1 && cy > 0 && cy < height - 1) {
-                        const int center = cy * width + cx;
-                        value += sobel_x(dx, dy) * coefficients[center] +
-                                 sobel_y(dx, dy) * coefficients[n + center];
+                    if (interior(x - dx, y - dy, height, width)) {
+                        const int ly = threadIdx.y - dy + 1, lx = threadIdx.x - dx + 1;
+                        value += sobel_x(dx, dy) * coefficient_x[ly][lx] +
+                                 sobel_y(dx, dy) * coefficient_y[ly][lx];
                     }
                 }
             }
@@ -117,16 +161,13 @@ namespace lfs::training::kernels {
         }
     } // namespace
 
-    void GradientResidualWorkspace::ensure_size(const size_t pixels) {
+    void GradientResidualWorkspace::ensure_allocated() {
         using namespace lfs::core;
-        if (coefficients.is_valid() && coefficients.numel() >= 2 * pixels)
+        if (partial.is_valid())
             return;
-        coefficients = Tensor::empty({2 * pixels}, Device::CUDA);
-        if (!partial.is_valid()) {
-            partial = Tensor::empty({2 * MAX_BLOCKS}, Device::CUDA);
-            totals = Tensor::empty({2}, Device::CUDA);
-            loss = Tensor::empty({1}, Device::CUDA);
-        }
+        partial = Tensor::empty({2 * MAX_BLOCKS}, Device::CUDA);
+        totals = Tensor::empty({2}, Device::CUDA);
+        loss = Tensor::empty({1}, Device::CUDA);
     }
 
     lfs::core::Tensor gradient_residual_loss_gradient(
@@ -152,34 +193,34 @@ namespace lfs::training::kernels {
             LFS_ASSERT(pixel_weight.dtype() == DataType::Float32 || pixel_weight.dtype() == DataType::UInt8 ||
                        pixel_weight.dtype() == DataType::Bool);
         }
-        workspace.ensure_size(static_cast<size_t>(n));
+        workspace.ensure_allocated();
         const auto stream = image.stream();
-        workspace.coefficients.set_stream(stream);
         workspace.partial.set_stream(stream);
         workspace.totals.set_stream(stream);
         workspace.loss.set_stream(stream);
         gradient.set_stream(stream);
         const int blocks = std::min((n + BLOCK_SIZE - 1) / BLOCK_SIZE, MAX_BLOCKS);
-        auto launch = [&]<typename T>(const T* target_ptr) {
-            if (pixel_weight.is_valid() && pixel_weight.dtype() != DataType::Float32) {
-                gradient_residual_forward<<<blocks, BLOCK_SIZE, 0, stream>>>(
-                    image.ptr<float>(), target_ptr, pixel_weight.ptr<uint8_t>(),
-                    workspace.coefficients.ptr<float>(), workspace.partial.ptr<float>(), height, width, GRADIENT_LOSS_EPSILON);
-            } else {
-                const float* mask = pixel_weight.is_valid() ? pixel_weight.ptr<float>() : nullptr;
-                gradient_residual_forward<<<blocks, BLOCK_SIZE, 0, stream>>>(
-                    image.ptr<float>(), target_ptr, mask,
-                    workspace.coefficients.ptr<float>(), workspace.partial.ptr<float>(), height, width, GRADIENT_LOSS_EPSILON);
-            }
+        const dim3 tiles((width + TILE_X - 1) / TILE_X, (height + TILE_Y - 1) / TILE_Y);
+        const dim3 tile_threads(TILE_X, TILE_Y);
+        auto launch = [&]<typename T, typename M>(const T* target_ptr, const M* mask) {
+            gradient_residual_forward<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                image.ptr<float>(), target_ptr, mask, workspace.partial.ptr<float>(), height, width, GRADIENT_LOSS_EPSILON);
+            gradient_residual_reduce<<<1, BLOCK_SIZE, 0, stream>>>(
+                workspace.partial.ptr<float>(), workspace.totals.ptr<float>(), workspace.loss.ptr<float>(), blocks, weight);
+            gradient_residual_backward<<<tiles, tile_threads, 0, stream>>>(
+                image.ptr<float>(), target_ptr, mask, workspace.totals.ptr<float>(), gradient.ptr<float>(),
+                height, width, GRADIENT_LOSS_EPSILON);
+        };
+        auto launch_masked = [&]<typename T>(const T* target_ptr) {
+            if (pixel_weight.is_valid() && pixel_weight.dtype() != DataType::Float32)
+                launch(target_ptr, pixel_weight.ptr<uint8_t>());
+            else
+                launch(target_ptr, pixel_weight.is_valid() ? pixel_weight.ptr<float>() : static_cast<const float*>(nullptr));
         };
         if (target.dtype() == DataType::UInt8)
-            launch(target.ptr<uint8_t>());
+            launch_masked(target.ptr<uint8_t>());
         else
-            launch(target.ptr<float>());
-        gradient_residual_reduce<<<1, BLOCK_SIZE, 0, stream>>>(
-            workspace.partial.ptr<float>(), workspace.totals.ptr<float>(), workspace.loss.ptr<float>(), blocks, weight);
-        gradient_residual_backward<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            workspace.coefficients.ptr<float>(), workspace.totals.ptr<float>(), gradient.ptr<float>(), height, width);
+            launch_masked(target.ptr<float>());
         LFS_CUDA_LAUNCH_CHECK(stream, "training.gradient_residual");
         return workspace.loss;
     }
