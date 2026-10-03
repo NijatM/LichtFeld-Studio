@@ -542,6 +542,12 @@ namespace lfs::core {
                     lazy->materializer = {};
 
                     try {
+                        // Materializers launch on the current stream. Without one they would
+                        // use the legacy stream, unordered with this tensor's declared home.
+                        std::optional<CUDAStreamGuard> home_stream;
+                        if (device_ == Device::CUDA && stream() != nullptr && getCurrentCUDAStream() == nullptr &&
+                            !is_stream_retired(stream()))
+                            home_stream.emplace(stream());
                         materialized = internal::lazy_planner_execute_plan_for_tensor(*this, materializer);
                         validate_materialized(materialized);
                         lazy->result = materialized;
@@ -888,7 +894,7 @@ namespace lfs::core {
                 // Rehoming changes where future writes occur. Preserve prior writes
                 // from the old home before changing allocator ownership metadata.
                 bridgeStreams(state_->stream, stream);
-                if (!has_external_storage()) {
+                if (!has_external_storage() && data_ != nullptr) {
                     CudaMemoryPool::instance().rehome_stream(data_owner_.get(), stream);
                 }
             }
@@ -1698,6 +1704,12 @@ namespace lfs::core {
         if (!is_contiguous_) {
             return contiguous().to(dtype);
         }
+
+        // Convert on the current stream, or this tensor's own when none is set,
+        // after the work that produced this tensor.
+        std::optional<CUDAStreamGuard> conversion_stream;
+        if (device_ == Device::CUDA)
+            conversion_stream.emplace(prepare_inputs_for_stream({this}));
 
 // Macro for type conversions using launch_convert_type
 #define CONVERT_DTYPE_CUDA(FROM_TYPE, TO_TYPE, FROM_DTYPE, TO_DTYPE)                \
