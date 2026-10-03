@@ -6128,11 +6128,13 @@ namespace lfs::training {
 
                 // Per-camera maps cached from the target must not see a per-iteration background.
                 const lfs::core::Tensor source_gt = gt_image;
+                lfs::core::Tensor stable_gt = gt_image;
                 if (composite_target_alpha_ && pipelined_mask_.is_valid() &&
                     params_.optimization.mask_mode == lfs::core::param::MaskMode::None &&
                     params_.optimization.use_alpha_as_mask) {
                     gt_image = kernels::composite_over_background(gt_image, pipelined_mask_,
                                                                   bg_image.is_valid() ? bg_image : bg);
+                    stable_gt = kernels::composite_over_background(source_gt, pipelined_mask_, background_);
                 }
 
                 const bool fastgs_path = !params_.optimization.gut;
@@ -6161,6 +6163,7 @@ namespace lfs::training {
                 RenderOutput r_output;
                 r_output.camera = cam;
                 r_output.target_image = gt_image;
+                r_output.stable_target_image = stable_gt;
                 int tiles_processed = 0;
                 const bool in_sparsification = get_active_sparsify_steps() > 0 &&
                                                iter > get_sparsity_boundary_iteration();
@@ -6657,6 +6660,7 @@ namespace lfs::training {
                     r_output = output; // Save last tile for densification
                     r_output.camera = cam;
                     r_output.target_image = gt_image;
+                    r_output.stable_target_image = stable_gt;
                     nvtxRangePop();
 
                     bool tile_context_cleaned = false;
@@ -6770,7 +6774,7 @@ namespace lfs::training {
                             const bool use_mask = params_.optimization.mask_mode != lfs::core::param::MaskMode::None &&
                                                   (cam->has_mask() || (params_.optimization.use_alpha_as_mask && cam->has_alpha()));
                             const auto structure_map = get_thin_structure_map(
-                                cam->uid(), gt_tile, params_.optimization.thin_structure_weight);
+                                cam->uid(), stable_gt, params_.optimization.thin_structure_weight);
                             if (use_mask || roi_weight.is_valid() || structure_map.is_valid()) {
                                 lfs::core::Tensor mask;
                                 if (use_mask) {
@@ -7010,7 +7014,7 @@ namespace lfs::training {
                             LFS_VRAM_SCOPE("train.photometric_loss");
                             LOG_VRAM_DIFF("train.photometric_loss");
                             const auto structure_map = get_thin_structure_map(
-                                cam->uid(), gt_tile, params_.optimization.thin_structure_weight);
+                                cam->uid(), stable_gt, params_.optimization.thin_structure_weight);
                             if (use_mask || roi_weight.is_valid() || structure_map.is_valid()) {
                                 lfs::core::Tensor mask;
                                 if (use_mask) {
@@ -7594,7 +7598,7 @@ namespace lfs::training {
 
                         if (tile_error_map.is_valid() && params_.optimization.densify_structure_weight > 0.0f) {
                             const auto structure_map = get_thin_structure_map(
-                                cam->uid(), gt_tile, params_.optimization.densify_structure_weight);
+                                cam->uid(), stable_gt, params_.optimization.densify_structure_weight);
                             kernels::structure_densification_weight(tile_error_map, structure_map,
                                                                     params_.optimization.densify_structure_weight);
                         }

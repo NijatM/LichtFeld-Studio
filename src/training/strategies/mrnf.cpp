@@ -1133,9 +1133,10 @@ namespace lfs::training {
     void MRNF::post_render(int iter, RenderOutput& render_output) {
         accumulate_explore_sample(iter, render_output);
         cache_seed_view(iter, render_output);
-        if (_blob_seeder && render_output.camera && iter < effective_grow_until_iter() &&
-            is_cuda_image(render_output.target_image)) {
-            _blob_seeder->capture(*render_output.camera, to_float01_cuda(render_output.target_image));
+        const auto& seed_image = render_output.stable_target_image.is_valid() ? render_output.stable_target_image
+                                                                              : render_output.target_image;
+        if (_blob_seeder && render_output.camera && iter < effective_grow_until_iter() && is_cuda_image(seed_image)) {
+            _blob_seeder->capture(*render_output.camera, to_float01_cuda(seed_image));
         }
     }
 
